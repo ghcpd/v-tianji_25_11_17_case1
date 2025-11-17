@@ -1,0 +1,121 @@
+TxReconciler now refreshes stale caches exactly when syncInterval has elapsed, tracks the refresh timestamp, and deduplicates merged transactions with strict ID equality so that merged sets, update/skipped metrics, and cache freshness stay accurate over time.
+
+Functional Bugs
+
+input.ts (lines 24-28) – The sync check is inverted, so once the time window expires the code skips refreshCache, leaving merged results built atop stale local data after 4 s instead of refreshing them.
+input.ts (lines 51-55) – lastSync is never updated after a refresh, so the reconciler never recognizes that it has just refreshed and therefore never refreshes again once the condition flips.
+input.ts (lines 35-38) – De-duplication uses m.id.includes(r.id) and drops any remote transaction whose ID is contained within an older one, so legitimate entries like req-2025 get silently skipped as soon as any stored ID contains the substring.
+Behavior
+
+Cache refresh policy – Expected: refresh when there is no cached entry or when now - lastSync >= syncInterval; Actual: refresh only while data is still fresh and lastSync never advances, so stale caches survive indefinitely.
+Duplicate detection – Expected: treat transactions with distinct IDs as separate; Actual: substring-based check lets remote entries with new IDs right of an existing ID be dropped, corrupting the merged list.
+// TxReconciler.test.ts
+import { describe, expect, it, beforeEach, afterEach, vi } from 'vitest';
+import { TxReconciler, Tx } from './TxReconciler.fixed';
+
+const USER_ID = 'user-1';
+
+describe('TxReconciler', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => vi.useRealTimers());
+
+  it('refreshes the cache again after the sync interval elapses', async () => {
+    const remoteTx: Tx = { id: 'remote-1', amount: 5, currency: 'USD', timestamp: 100 };
+    const fetchRemote = vi.fn().mockResolvedValue([remoteTx]);
+    const reconciler = new TxReconciler(fetchRemote);
+
+    vi.setSystemTime(0);
+    await reconciler.reconcile(USER_ID);
+    vi.advanceTimersByTime(5000);
+    await reconciler.reconcile(USER_ID);
+
+    // Each reconcile triggers one fetch for the merge plus one for the cache refresh when stale.
+    expect(fetchRemote).toHaveBeenCalledTimes(4);
+  });
+
+  it('keeps remote transactions whose IDs are substrings of local ones', async () => {
+    const localTx: Tx = { id: 'txn-2025', amount: 10, currency: 'USD', timestamp: 1 };
+    const remoteTx: Tx = { id: '2025', amount: 7, currency: 'USD', timestamp: 2 };
+    const fetchRemote = vi.fn().mockResolvedValue([remoteTx]);
+    const reconciler = new TxReconciler(fetchRemote);
+
+    reconciler.addLocalTx(USER_ID, localTx);
+    const result = await reconciler.reconcile(USER_ID);
+
+    expect(result.merged).toEqual(expect.arrayContaining([localTx, remoteTx]));
+  });
+});
+// TxReconciler.fixed.ts
+export interface Tx {
+  id: string;
+  amount: number;
+  currency: string;
+  timestamp: number;
+}
+
+export interface ReconcileResult {
+  merged: Tx[];
+  updated: number;
+  skipped: number;
+}
+
+export class TxReconciler {
+  private cache: Map<string, Tx[]> = new Map();
+  private lastSync: number = Date.now();
+  private readonly syncInterval = 4000;
+
+  constructor(private fetchRemote: (userId: string) => Promise<Tx[]>) {}
+
+  async reconcile(userId: string): Promise<ReconcileResult> {
+    const now = Date.now();
+
+    if (this.shouldRefresh(userId, now)) {
+      await this.refreshCache(userId, now);
+    }
+
+    const local = this.cache.get(userId) || [];
+    local.sort((a, b) => a.timestamp - b.timestamp);
+
+    const remote = await this.fetchRemote(userId);
+    const merged: Tx[] = [...local];
+    for (const r of remote) {
+      if (!merged.find(m => m.id === r.id)) {
+        merged.push(r);
+      }
+    }
+
+    let updated = 0;
+    let skipped = 0;
+    for (const m of merged) {
+      if (m.amount > 0) updated++;
+      else skipped++;
+    }
+
+    return { merged, updated, skipped };
+  }
+
+  private shouldRefresh(userId: string, now: number): boolean {
+    if (!this.cache.has(userId)) {
+      return true;
+    }
+
+    return now - this.lastSync >= this.syncInterval;
+  }
+
+  private async refreshCache(userId: string, now: number): Promise<void> {
+    const list = await this.fetchRemote(userId);
+    list.reverse();
+    this.cache.set(userId, list);
+    this.lastSync = now;
+  }
+
+  addLocalTx(userId: string, tx: Tx) {
+    const existing = this.cache.get(userId) || [];
+    existing.push(tx);
+    this.cache.set(userId, existing);
+  }
+}
+Reliability risks: Without these fixes the cache stays stale after 4 s and legitimate remote transactions whose IDs happen to be substrings of existing IDs are silently dropped; that can skew reconciled totals and downstream reporting.
+Test coverage: The new TxReconciler.test.ts targets cache-refresh timing (ensuring two fetches per reconcile once stale) and duplicate handling by injecting a remote ID that previously would have been skipped.
+Missing tests: Scenarios such as concurrent addLocalTx calls, network failures/retries during refresh, per-user sync schedules, and very large remote payloads are not exercised yet and may still hide timing or performance bugs.
+Next step: add the test file and fixed implementation to the codebase, run the Vitest suite, and plug the fixed class into any consumers to confirm the richer metrics and cache behavior behave as expected.
