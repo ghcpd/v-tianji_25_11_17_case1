@@ -1,0 +1,195 @@
+Bugs
+
+input.ts (lines 24-28) & input.ts (line 16): the staleness gate is backwards and lastSync is never updated, so the refresh flow only runs when the cache is already fresh and never runs again once it is stale, leaving every user stuck with permanently outdated data.
+input.ts (lines 52-60): refreshCache replaces the cached list wholesale before reconcile reads it; any transactions queued via addLocalTx are wiped out before they can be merged, so local/offline additions can never survive a refresh.
+input.ts (lines 35-37): duplicate detection relies on includes instead of equality, so unrelated IDs that merely share substrings are treated as the same transaction, while true duplicates never get updated.
+input.ts (lines 30-48): the merge loop only appends new remote entries and never replaces existing ones, and the reconciled list is never written back to this.cache, so even the data returned from reconcile stays stale after a remote update and the cache never reflects the merged state.
+input.ts (lines 41-45): the updated/skipped counters are tied to the sign of amount rather than to reconciliation actions, yielding meaningless metrics (e.g., all refunds are counted as “skipped” even when they were just merged).
+Technical Documentation (expected vs actual)
+
+Refresh cadence (input.ts (line 16), input.ts (lines 24-28)): expected behaviour is to refresh cached data whenever now - lastSync >= syncInterval and record the new sync time per user; actual code refreshes only when the cache is still fresh and never updates lastSync, so stale caches persist forever.
+Local staging (input.ts (lines 52-60)): expected behaviour is to keep locally added transactions until they are reconciled; actual code overwrites the cache with the remote snapshot before merging, so local entries disappear immediately.
+Transaction identity (input.ts (lines 35-37)): expected behaviour is to treat IDs as exact keys and update existing entries when the remote source changes; actual code performs substring comparisons, so unrelated IDs collide, and even when the same ID changes it remains stale.
+Cache persistence (input.ts (lines 30-48)): expected behaviour is for reconciliation to emit the merged list and persist it for subsequent runs; actual code never writes the merged data back into this.cache, so subsequent reconciliations always start from stale state.
+Result metrics (input.ts (lines 41-45)): expected behaviour is for updated to count inserts/replacements and skipped to count duplicates; actual code counts “positive amount” vs “other”, which is unrelated to reconciliation quality.
+Test Suite (e.g., TxReconciler.spec.ts)
+
+import { Tx, TxReconciler } from './TxReconciler.fixed';
+
+const tx = (overrides: Partial<Tx> = {}): Tx => ({
+  id: overrides.id ?? 'tx-1',
+  amount: overrides.amount ?? 1,
+  currency: overrides.currency ?? 'USD',
+  timestamp: overrides.timestamp ?? 1,
+});
+
+describe('TxReconciler', () => {
+  afterEach(() => {
+    jest.restoreAllMocks();
+  });
+
+  it('refreshes caches only after the sync interval and records the per-user sync time', async () => {
+    let now = 0;
+    jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const fetchRemote = jest.fn().mockResolvedValue([tx({ id: 'remote', timestamp: now })]);
+
+    const reconciler = new TxReconciler(fetchRemote);
+    await reconciler.reconcile('user');
+
+    const lastSync = (reconciler as any).lastSyncByUser as Map<string, number>;
+    expect(lastSync.get('user')).toBe(0);
+
+    now = 2000;
+    await reconciler.reconcile('user');
+    expect(lastSync.get('user')).toBe(0);
+
+    now = 6000;
+    await reconciler.reconcile('user');
+    expect(lastSync.get('user')).toBe(6000);
+  });
+
+  it('replaces stale cached entries with remote updates and reports them as updated', async () => {
+    const fetchRemote = jest
+      .fn()
+      .mockResolvedValueOnce([tx({ id: 'tx-1', amount: 10, timestamp: 1 })])
+      .mockResolvedValueOnce([tx({ id: 'tx-1', amount: 20, timestamp: 2 })]);
+
+    const reconciler = new TxReconciler(fetchRemote);
+    await reconciler.reconcile('user');
+    const result = await reconciler.reconcile('user');
+
+    expect(result.merged).toHaveLength(1);
+    expect(result.merged[0].amount).toBe(20);
+    expect(result.updated).toBe(1);
+    expect(result.skipped).toBe(0);
+  });
+
+  it('keeps locally added transactions when a refresh occurs', async () => {
+    let now = 0;
+    jest.spyOn(Date, 'now').mockImplementation(() => now);
+    const fetchRemote = jest.fn().mockResolvedValue([tx({ id: 'remote', amount: 1, timestamp: 3 })]);
+
+    const reconciler = new TxReconciler(fetchRemote);
+    reconciler.addLocalTx('user', tx({ id: 'local', amount: 5, timestamp: 5 }));
+
+    now = 6000;
+    const result = await reconciler.reconcile('user');
+    expect(result.merged.map(t => t.id)).toEqual(expect.arrayContaining(['local', 'remote']));
+  });
+
+  it('treats transaction IDs strictly instead of using substring matches', async () => {
+    const fetchRemote = jest.fn().mockResolvedValue([tx({ id: 'abc', timestamp: 2 })]);
+    const reconciler = new TxReconciler(fetchRemote);
+
+    reconciler.addLocalTx('user', tx({ id: 'abc123', timestamp: 1 }));
+    const result = await reconciler.reconcile('user');
+
+    expect(result.merged.map(t => t.id).sort()).toEqual(['abc', 'abc123']);
+    expect(result.updated).toBe(1);
+    expect(result.skipped).toBe(0);
+  });
+
+  it('counts skipped entries when remote state already matches the cache', async () => {
+    const snapshot = [tx({ id: 'same', amount: 30, timestamp: 3 })];
+    const fetchRemote = jest.fn().mockResolvedValue(snapshot);
+
+    const reconciler = new TxReconciler(fetchRemote);
+    await reconciler.reconcile('user');
+    const result = await reconciler.reconcile('user');
+
+    expect(result.updated).toBe(0);
+    expect(result.skipped).toBe(1);
+  });
+});
+Fixed Implementation (TxReconciler.fixed.ts)
+
+export interface Tx {
+  id: string;
+  amount: number;
+  currency: string;
+  timestamp: number;
+}
+
+export interface ReconcileResult {
+  merged: Tx[];
+  updated: number;
+  skipped: number;
+}
+
+export class TxReconciler {
+  private cache: Map<string, Tx[]> = new Map();
+  private lastSyncByUser: Map<string, number> = new Map();
+  private readonly syncInterval = 4000;
+
+  constructor(private fetchRemote: (userId: string) => Promise<Tx[]>) {}
+
+  async reconcile(userId: string): Promise<ReconcileResult> {
+    const now = Date.now();
+    const localSnapshot = [...(this.cache.get(userId) ?? [])];
+    const lastSync = this.lastSyncByUser.get(userId) ?? 0;
+    const shouldRefresh = now - lastSync >= this.syncInterval || !this.cache.has(userId);
+
+    const remote = shouldRefresh
+      ? await this.refreshSnapshot(userId, now)
+      : await this.fetchRemote(userId);
+
+    const reconciliation = this.mergeTransactions(localSnapshot, remote);
+    this.cache.set(userId, reconciliation.merged);
+
+    return reconciliation;
+  }
+
+  addLocalTx(userId: string, tx: Tx): void {
+    const updated = [...(this.cache.get(userId) ?? []), tx];
+    updated.sort((a, b) => a.timestamp - b.timestamp);
+    this.cache.set(userId, updated);
+  }
+
+  private async refreshSnapshot(userId: string, now: number): Promise<Tx[]> {
+    const snapshot = await this.fetchRemote(userId);
+    this.lastSyncByUser.set(userId, now);
+    return snapshot;
+  }
+
+  private mergeTransactions(local: Tx[], remote: Tx[]): ReconcileResult {
+    const mergedMap = new Map<string, Tx>();
+    for (const tx of local) {
+      mergedMap.set(tx.id, tx);
+    }
+
+    let updated = 0;
+    let skipped = 0;
+
+    for (const remoteTx of remote) {
+      const existing = mergedMap.get(remoteTx.id);
+      if (!existing) {
+        mergedMap.set(remoteTx.id, remoteTx);
+        updated++;
+        continue;
+      }
+
+      if (this.hasChanged(existing, remoteTx)) {
+        mergedMap.set(remoteTx.id, remoteTx);
+        updated++;
+      } else {
+        skipped++;
+      }
+    }
+
+    const merged = [...mergedMap.values()].sort((a, b) => a.timestamp - b.timestamp);
+    return { merged, updated, skipped };
+  }
+
+  private hasChanged(a: Tx, b: Tx): boolean {
+    return (
+      a.amount !== b.amount ||
+      a.currency !== b.currency ||
+      a.timestamp !== b.timestamp
+    );
+  }
+}
+Summary
+
+Fixed refresh cadence, deduplication, cache persistence, and reconciliation metrics so the cache reflects remote truth and local additions survive refreshes; see TxReconciler.fixed.ts.
+Added Jest coverage for stale refresh behaviour, remote updates, local preservation, strict ID matching, and meaningful updated/skipped counters (TxReconciler.spec.ts); tests not run locally (read-only environment), so please execute jest after adding the files.
+Remaining risks: no tests yet for concurrent users, fetch errors/retries, or extremely large datasets—consider adding cases for multi-user interleaving and remote failures if those are in scope.
