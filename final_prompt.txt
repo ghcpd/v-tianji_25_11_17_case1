@@ -1,0 +1,12 @@
+Your task:
+Using the code in the file, generate the following:
+
+Identify all functional bugs with detailed explanations
+
+Provide technical documentation describing expected vs actual behavior
+
+Provide a comprehensive test suite (Jest or Vitest) to cover the bugs
+
+Provide a corrected fixed version of the code and output it as a separate file (e.g., TxReconciler.fixed.ts)
+
+Provide a final summary covering reliability risks, test coverage, and missing test scenarios
